@@ -1,0 +1,33 @@
+# Song files and local playback preferences are never published.
+*.[mM][iI][dD]
+*.[mM][iI][dD][iI]
+/songs/*
+!/songs/README.md
+song_labels*.json
+*.log
+
+# Generated packages, backups, and development caches.
+/build/
+/dist/
+/archives/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+*.zip
+*.exe
+*.apk
+
+# Local credentials and editor/agent settings.
+.env
+.env.*
+*.pem
+*.key
+.codex/
+.agents/
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

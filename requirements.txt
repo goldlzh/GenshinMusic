@@ -1,0 +1,3 @@
+mido==1.3.3
+pydirectinput==1.0.4
+pypinyin==0.55.0
