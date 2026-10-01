@@ -367,11 +367,13 @@ class PlaybackTimeline:
         self.origin = notes[0].start if notes else origin
         self.gaps = []
         self.starts = []
+        self.playback_starts = []
         shift = sounding_until = self.origin
         for note in notes:
             gap = note.start - sounding_until
             if gap > max_silence:
                 self.starts.append(sounding_until)
+                self.playback_starts.append(sounding_until - shift)
                 self.gaps.append((sounding_until, note.start, shift, gap - max_silence))
                 shift += gap - max_silence
             sounding_until = max(sounding_until, note.end)
@@ -384,6 +386,18 @@ class PlaybackTimeline:
         if seconds < end:
             return seconds - shift - removed * (seconds - start) / (end - start)
         return seconds - (shift + removed)
+
+    def inverse_position(self, seconds):
+        """演奏秒数还原为压缩前秒数；保留间奏中的位置按相同比例反解。"""
+        index = bisect.bisect_right(self.playback_starts, seconds) - 1
+        if index < 0:
+            return seconds + self.origin
+        start, end, shift, removed = self.gaps[index]
+        playback_start = start - shift
+        playback_end = end - shift - removed
+        if seconds < playback_end:
+            return start + (seconds - playback_start) * (end - start) / (playback_end - playback_start)
+        return seconds + shift + removed
 
 
 def compress_silence(notes, max_silence=MAX_SILENCE, log=print):
@@ -503,6 +517,40 @@ def build_schedule(notes, speed=1.0, log=lambda _: None):
     return compress_silence(_resolve_schedule(notes, speed), max_silence=MAX_SILENCE / speed, log=log)
 
 
+def _region_timeline(playable_notes, speed, tagged):
+    resolved = _resolve_schedule(playable_notes, speed)
+    return PlaybackTimeline(resolved, MAX_SILENCE / speed,
+                            origin=min((note.start / speed for note in tagged), default=0.0))
+
+
+def _region_seconds(start, end):
+    start, end = float(start), float(end)
+    if not math.isfinite(start) or not math.isfinite(end) or end < start:
+        raise ValueError('片段起止时间必须有限，且终点不能早于起点')
+    return start, end
+
+
+def playback_region_to_source(playable_notes, start_seconds, end_seconds, speed=1.0, tagged=()):
+    """把当前压缩演奏时间轴的半开区间还原成原谱秒数，保留不可奏音所在空白。"""
+    start, end = _region_seconds(start_seconds, end_seconds)
+    timeline = _region_timeline(playable_notes, speed, tagged)
+    return timeline.inverse_position(start) * speed, timeline.inverse_position(end) * speed
+
+
+def source_region_to_playback(playable_notes, raw_start, raw_end, speed=1.0, tagged=()):
+    """把同一原谱片段投影到重新编曲后的演奏时间轴，不改变原谱边界。"""
+    start, end = _region_seconds(raw_start, raw_end)
+    timeline = _region_timeline(playable_notes, speed, tagged)
+    return timeline.position(start / speed), timeline.position(end / speed)
+
+
+def select_tagged_region(tagged, playable_notes, start_seconds, end_seconds, speed=1.0):
+    """按当前演奏区间选择原谱起音，包含当前移调下不可奏或同键冲突淘汰的音。"""
+    tagged = list(tagged)
+    start, end = playback_region_to_source(playable_notes, start_seconds, end_seconds, speed, tagged)
+    return [note for note in tagged if start - TIME_EPSILON <= note.start < end - TIME_EPSILON]
+
+
 def build_unavailable_notes(tagged, transpose_offset, enable_fold, playable_notes,
                             speed=1.0, duration_mode='score', sustain_pedal=False):
     """保留无法映射的音符，并与实际按键共用时间变换，红音不延长演奏。"""
@@ -555,15 +603,24 @@ class KeyboardPlayer:
     _keyboard_lock = threading.Lock()
 
     def __init__(self, notes, speed, start_ratio, progress_cb, log_cb, finish_cb,
-                 *, keyboard, clock=None, waiter=None):
+                 *, keyboard, clock=None, waiter=None, end_ratio=1.0, region_start_ratio=0.0):
         self.notes = build_schedule(notes, speed, log=log_cb)
         self.total = max((note.end for note in self.notes), default=0.0)
+
+        def clamp_ratio(value, default):
+            value = float(value)
+            return max(0.0, min(value, 1.0)) if math.isfinite(value) else default
+
+        # start_ratio 仍是初始播放位置；区域下界独立，旧调用仍可向起播点前定位。
+        self.region_start = clamp_ratio(region_start_ratio, 0.0) * self.total
+        self.region_end = max(self.region_start, clamp_ratio(end_ratio, 1.0) * self.total)
         self.events = sorted((when, action, index)
                              for index, note in enumerate(self.notes)
-                             for when, action in ((note.start, 1), (note.end, 0)))
+                             if self.region_start - TIME_EPSILON <= note.start < self.region_end - TIME_EPSILON
+                             for when, action in ((note.start, 1), (min(note.end, self.region_end), 0)))
         self.event_times = [event[0] for event in self.events]
         self.speed = speed
-        self.play_time = max(0.0, min(start_ratio, 1.0)) * self.total
+        self.play_time = max(self.region_start, min(clamp_ratio(start_ratio, 0.0) * self.total, self.region_end))
         self.progress_cb, self.log, self.finish_cb = progress_cb, log_cb, finish_cb
         self.keyboard = keyboard
         self.clock = clock or time.perf_counter
@@ -614,7 +671,7 @@ class KeyboardPlayer:
         with self.seek_lock:
             self._requested_seek_serial += 1
             serial = self._requested_seek_serial
-            self.seek_request = (serial, max(0.0, min(seconds, self.total)))
+            self.seek_request = (serial, max(self.region_start, min(seconds, self.region_end)))
         self.wake_event.set()
         return serial
 
@@ -656,7 +713,8 @@ class KeyboardPlayer:
         if remaining > TIME_EPSILON:
             self._wait(min(remaining, 0.005))
             return False
-        if self.stop_event.is_set() or self.pause_event.is_set():
+        if (self.stop_event.is_set() or self.pause_event.is_set()
+                or self.play_time >= self.region_end - TIME_EPSILON):
             return False
         with self.seek_lock:
             if self.seek_request is not None:
@@ -671,7 +729,8 @@ class KeyboardPlayer:
         # 只恢复这次暂停前确实按住的音；起播或定位都不补按过去的延长线。
         for index in note_ids:
             note = self.notes[index]
-            if note.start < position - TIME_EPSILON and note.end > position + TIME_EPSILON:
+            if (note.start < position - TIME_EPSILON
+                    and min(note.end, self.region_end) > position + TIME_EPSILON):
                 while not self._press(index):
                     if self.stop_event.is_set() or self.pause_event.is_set():
                         return
@@ -702,7 +761,7 @@ class KeyboardPlayer:
                         self._progress()
                     if self.pause_event.is_set():
                         if not was_paused:
-                            self.play_time = min(self.total, self.clock() - reference)
+                            self.play_time = min(self.region_end, self.clock() - reference)
                             self._visual_phase = 'paused'
                             paused_notes = tuple(self.pressed.values())
                             self._release_all()
@@ -717,13 +776,17 @@ class KeyboardPlayer:
                         paused_notes = ()
                         reference = self.clock() - self.play_time
                         was_paused = False
-                    self.play_time = min(self.total, self.clock() - reference)
+                    self.play_time = min(self.region_end, self.clock() - reference)
                     if self.clock() >= next_progress:
                         self._progress()
                         next_progress = self.clock() + 0.033
-                    if index >= len(self.events):
+                    if self.play_time >= self.region_end - TIME_EPSILON:
                         finished = True
                         break
+                    if index >= len(self.events):
+                        # 区间尾部可能没有新起音，也要等到选定终点，不能提前完成。
+                        self._wait(min(self.region_end - self.play_time, 0.005))
+                        continue
                     target, action, note_id = self.events[index]
                     remaining = target - self.play_time
                     if remaining > TIME_EPSILON:
@@ -748,6 +811,6 @@ class KeyboardPlayer:
                 self._release_all()
         finished = finished and not self.stop_event.is_set()
         if finished:
-            self.play_time = self.total
+            self.play_time = self.region_end
             self._progress()
         self.finish_cb(finished)

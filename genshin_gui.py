@@ -10,7 +10,7 @@ import ctypes
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from song_memory import clamp_ratio, normalize_memory, preferred_memory, resolve_memory_start
+from song_memory import clamp_ratio, normalize_memory, normalize_play_range, normalize_source_range, preferred_memory, resolve_memory_start
 from song_library import (SORT_MODES, normalize_sort_mode, song_key, song_entry,
                           sort_songs, register_songs, format_timestamp)
 
@@ -30,11 +30,12 @@ pydirectinput.PAUSE = 0
 pydirectinput.FAILSAFE = False
 
 from midi_engine import (
-    NOTE_MAP, DRUM_CHANNEL, DURATION_MODES, KeyboardPlayer,
+    NOTE_MAP, DRUM_CHANNEL, DURATION_MODES, TIME_EPSILON, KeyboardPlayer,
     analyze_midi, auto_select_channels, filter_channels, detect_melody,
     detect_glissando, remove_glissando, keep_melody_only, find_best_transpose,
     count_playable, count_chords, finalize_notes, performance_duration,
     build_schedule, build_unavailable_notes, PlaybackSnapshot,
+    select_tagged_region, playback_region_to_source, source_region_to_playback,
 )
 from performance_view import PerformanceView, time_text
 from live_midi import LiveMidiInput, LiveSettings, midi_backend, is_genshin_foreground
@@ -101,9 +102,10 @@ def format_time(sec):
 
 
 class Player(KeyboardPlayer):
-    def __init__(self, notes, speed, start_ratio, progress_cb, log_cb, finish_cb):
+    def __init__(self, notes, speed, start_ratio, progress_cb, log_cb, finish_cb,
+                 *, region_start_ratio=0.0, end_ratio=1.0):
         super().__init__(notes, speed, start_ratio, progress_cb, log_cb, finish_cb,
-                         keyboard=pydirectinput)
+                         keyboard=pydirectinput, region_start_ratio=region_start_ratio, end_ratio=end_ratio)
 
 
 class GlobalHotkey:
@@ -298,6 +300,13 @@ class App:
         # 起播点与不断更新的播放进度分离，避免记忆被进度回调覆盖。
         self.start_label_id = None
         self.start_ratio = 0.0
+        self.play_range = {"start": 0.0, "end": 1.0}
+        self._active_play_range = dict(self.play_range)
+        self._region_selecting = False
+        self._region_anchor = None
+        self._region_consumed_click = False
+        self._range_dragging = None
+        self._suggestion_source_range = None
         self.hotkey_managers = {}
 
         self.info = None
@@ -427,6 +436,9 @@ class App:
         trans_entry.bind("<Return>", lambda e: self._refresh_total())
         trans_entry.bind("<FocusOut>", lambda e: self._refresh_total())
         ttk.Button(param, text="用建议值", command=self._use_suggested).grid(row=3, column=2, sticky="w", **pad)
+        self.region_select_btn = ttk.Button(param, text="选择歌曲部分", command=self._begin_region_selection)
+        self.region_select_btn.grid(row=3, column=3, sticky="w", **pad)
+        self.root.bind("<Escape>", lambda e: self._cancel_region_selection())
 
         ttk.Label(param, text="播放速度:").grid(row=4, column=0, sticky="w", **pad)
         self.speed_var = tk.DoubleVar(value=1.0)
@@ -478,24 +490,35 @@ class App:
         # 进度条（可拖动跳转）及其可点击标签层
         prog = ttk.Frame(self.root)
         prog.grid(row=5, column=0, sticky="ew", padx=8, pady=2)
-        marker_row = ttk.Frame(prog)
-        marker_row.pack(fill="x")
-        self.marker_canvas = tk.Canvas(marker_row, height=30, highlightthickness=0,
+        # 标签与滑块共享一列，时间文字只占右列，避免两条轨道宽度不一致。
+        prog.columnconfigure(0, weight=1)
+        self.marker_canvas = tk.Canvas(prog, height=30, highlightthickness=0,
                                        background=self.root.cget("background"))
-        self.marker_canvas.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Label(marker_row, text="", width=12).pack(side="right")
-        self.marker_canvas.bind("<Configure>", lambda e: self._draw_labels())
+        self.marker_canvas.grid(row=0, column=0, sticky="ew", padx=4)
+        self.marker_canvas.bind("<Configure>", lambda e: self.root.after_idle(self._draw_labels))
 
-        seek_row = ttk.Frame(prog)
-        seek_row.pack(fill="x")
         self.seek_var = tk.DoubleVar(value=0.0)
-        self.seek_scale = ttk.Scale(seek_row, from_=0.0, to=1.0, variable=self.seek_var,
+        self.seek_scale = ttk.Scale(prog, from_=0.0, to=1.0, variable=self.seek_var,
                                     orient="horizontal", command=self._on_scale_move)
-        self.seek_scale.pack(side="left", fill="x", expand=True, padx=4)
+        self.seek_scale.grid(row=1, column=0, sticky="ew", padx=4)
         self.seek_scale.bind("<Button-1>", self._on_scale_press)
         self.seek_scale.bind("<ButtonRelease-1>", self._on_scale_release)
-        self.time_label = ttk.Label(seek_row, text="0:00/0:00", width=23)
-        self.time_label.pack(side="right")
+        self.seek_scale.bind("<Configure>", lambda e: self.root.after_idle(self._draw_labels))
+        self.seek_scale.bind("<<ThemeChanged>>", lambda e: self.root.after_idle(self._draw_labels))
+        self.time_label = ttk.Label(prog, text="0:00/0:00", width=23)
+        self.time_label.grid(row=1, column=1, sticky="w")
+        self.seek_scale.bind("<B1-Motion>", lambda e: "break" if
+                             self._region_selecting or self._region_consumed_click else None)
+        self.range_canvas = tk.Canvas(prog, height=34, highlightthickness=0,
+                                      background=self.root.cget("background"), cursor="hand2")
+        self.range_canvas.grid(row=2, column=0, sticky="ew", padx=4)
+        self.range_canvas.bind("<Configure>", lambda e: self.root.after_idle(self._draw_range))
+        self.range_canvas.bind("<Button-1>", self._on_range_press)
+        self.range_canvas.bind("<B1-Motion>", self._on_range_motion)
+        self.range_canvas.bind("<ButtonRelease-1>", self._on_range_release)
+        ttk.Button(prog, text="恢复全曲", command=self._reset_play_range).grid(row=2, column=1, sticky="w")
+        self.range_status_var = tk.StringVar(value="播放区间：全曲；拖动下方起止指针可调整")
+        ttk.Label(prog, textvariable=self.range_status_var).grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
 
         memory_frame = ttk.LabelFrame(self.root, text="歌曲记忆")
         memory_frame.grid(row=6, column=0, sticky="ew", padx=8, pady=4)
@@ -758,6 +781,194 @@ class App:
     def _current_labels(self, create=False):
         return self._current_song_entry(create).get("labels", [])
 
+    # ---------- 选段转调与区域播放 ----------
+    def _progress_track_geometry(self, canvas):
+        scale = self.seek_scale
+        width, height = scale.winfo_width(), scale.winfo_height()
+        if width <= 2 or height <= 1:
+            return None
+        # 查询实际主题轨道，不移动滑块或调用定位；布局完成后再绘制。
+        x1, x2 = width // 3, 2 * width // 3
+        v1, v2 = (float(scale.get(x, height // 2)) for x in (x1, x2))
+        if not 0.0 < v1 < v2 < 1.0:
+            return None
+        travel = (x2 - x1) / (v2 - v1)
+        return scale.winfo_rootx() - canvas.winfo_rootx() + x1 - v1 * travel, travel
+
+    def _has_play_range(self):
+        return self.play_range['start'] > 0 or self.play_range['end'] < 1
+
+    def _clamp_to_play_range(self, ratio):
+        return max(self.play_range['start'], min(clamp_ratio(ratio), self.play_range['end']))
+
+    def _sync_visual_region(self):
+        total = self.visual_total
+        start, end = (self.play_range[key] * total for key in ('start', 'end'))
+        for view in (self.visual_view, self.floating_visual):
+            if view is not None:
+                view.set_play_range(start, end) if self._has_play_range() or self._suggestion_source_range is not None else view.set_play_range(None, None)
+                view.set_selection_anchor(None if self._region_anchor is None else self._region_anchor * total)
+        if hasattr(self, 'range_status_var'):
+            text = f"播放区间：{time_text(start)} — {time_text(end)} ({self.play_range['start']:.1%} — {self.play_range['end']:.1%})"
+            if self._region_selecting:
+                text += '；请点击第一个点' if self._region_anchor is None else '；已选起点，请点击第二个点'
+            self.range_status_var.set(text)
+        self._draw_range()
+
+    def _draw_range(self):
+        if not hasattr(self, 'range_canvas'):
+            return
+        canvas = self.range_canvas
+        canvas.delete('all')
+        geometry = self._progress_track_geometry(canvas)
+        if geometry is None:
+            return
+        left, travel = geometry
+        x1, x2 = (left + self.play_range[key] * travel for key in ('start', 'end'))
+        canvas.create_line(left, 10, left + travel, 10, fill='#b5b5b5', width=3)
+        canvas.create_line(x1, 10, x2, 10, fill='#3b8dbd', width=6, tags='play_range')
+        for key, x, color, text in (('start', x1, '#218250', '起'), ('end', x2, '#c26b16', '止')):
+            canvas.create_polygon(x, 6, x - 6, 18, x + 6, 18, fill=color, outline=color, tags=f'range_{key}')
+            canvas.create_text(x, 26, text=text, fill=color, tags=f'range_{key}')
+        if self._region_anchor is not None:
+            x = left + self._region_anchor * travel
+            canvas.create_line(x, 0, x, 33, fill='#a52e99', dash=(3, 2), tags='selection_anchor')
+
+    def _begin_region_selection(self):
+        if self._region_selecting:
+            self._cancel_region_selection()
+            self.set_status('已取消选段，保留原播放区间。')
+            return
+        if not self.tagged:
+            self.set_status('请先解析歌曲。')
+            return
+        if self.session_active or self.player:
+            self._on_stop()
+        self._stop_live(True)
+        self._refresh_total()
+        if self.visual_total <= 0:
+            self.set_status('当前没有可显示的演奏时间轴，请先使用整曲建议转调。')
+            return
+        self._region_selecting = True
+        self._region_anchor = None
+        self.region_select_btn.config(text='取消选择')
+        self._sync_visual_region()
+        self.set_status('请在进度条或演奏可视化中先后点击两个位置；Esc 可取消。')
+
+    def _cancel_region_selection(self):
+        self._region_selecting = False
+        self._region_anchor = None
+        if hasattr(self, 'region_select_btn'):
+            self.region_select_btn.config(text='选择歌曲部分')
+        if hasattr(self, 'visual_view'):
+            self._sync_visual_region()
+
+    def _source_range_for(self, start, end):
+        return playback_region_to_source(self.cached_notes, start * self.visual_total,
+                                         end * self.visual_total, round(self.speed_var.get(), 2),
+                                         tagged=self._effective_tagged())
+
+    def _apply_source_range(self, source_range):
+        if self.visual_total <= 0:
+            return
+        start, end = source_region_to_playback(self.cached_notes, *source_range,
+                                               speed=round(self.speed_var.get(), 2), tagged=self._effective_tagged())
+        start, end = clamp_ratio(start / self.visual_total), clamp_ratio(end / self.visual_total)
+        gap = max(.000001, min(.01, .001 / self.visual_total))
+        if end <= start:
+            start = min(start, 1 - gap)
+            end = min(1.0, start + gap)
+        self.play_range = normalize_play_range({'start': start, 'end': end})
+        self._sync_visual_region()
+
+    def _accept_region_point(self, ratio):
+        ratio = clamp_ratio(ratio)
+        if self._region_anchor is None:
+            self._region_anchor = ratio
+            self._sync_visual_region()
+            self.set_status('已选第一个点，请点击片段另一端；两点可按任意顺序选择。')
+            return
+        start, end = sorted((self._region_anchor, ratio))
+        if (end - start) * self.visual_total < .001:
+            self.set_status('两个位置太接近，请选择另一端。')
+            return
+        tagged = select_tagged_region(self._effective_tagged(), self.cached_notes,
+                                      start * self.visual_total, end * self.visual_total,
+                                      speed=round(self.speed_var.get(), 2))
+        if not tagged:
+            self.set_status('这段没有可用于识别的音符，请重新选择第二个点。')
+            return
+        source_range = self._source_range_for(start, end)
+        self._cancel_region_selection()
+        self.play_range = normalize_play_range({'start': start, 'end': end})
+        self._suggestion_source_range = source_range
+        self._update_suggestions(region_notes=tagged)
+        self.transpose_var.set(str(self.suggested_offset))
+        self._refresh_total()
+        self._move_playhead(self.play_range['start'])
+        self._refresh_memory_status()
+        self.set_status(f'已按选中片段的 {len(tagged)} 个音符应用建议转调 {self.suggested_offset:+d}；点击播放演奏该区间。')
+
+    def _set_play_range(self, start, end, *, move_to_start=True, update_suggestions=True):
+        new_range = normalize_play_range({'start': start, 'end': end})
+        if new_range != self.play_range and (self.session_active or self.player):
+            self._on_stop()
+            self._refresh_total()
+        self.play_range = new_range
+        self._suggestion_source_range = (self._source_range_for(new_range['start'], new_range['end'])
+                                         if self._has_play_range() and self.visual_total > 0 else None)
+        self._sync_visual_region()
+        if move_to_start:
+            self._move_playhead(self.play_range['start'])
+        if update_suggestions and self.tagged:
+            self._update_suggestions()
+        self._refresh_memory_status()
+
+    def _reset_play_range(self):
+        self._cancel_region_selection()
+        self._set_play_range(0, 1)
+        self.set_status('已恢复全曲播放与整曲转调建议。')
+
+    def _on_range_press(self, event):
+        if self.visual_total <= 0:
+            return 'break'
+        self._cancel_region_selection()
+        if self.session_active or self.player:
+            self._on_stop()
+        self._refresh_total()
+        geometry = self._progress_track_geometry(self.range_canvas)
+        if geometry is None:
+            return 'break'
+        left, travel = geometry
+        ratio = clamp_ratio((event.x - left) / travel)
+        self._range_dragging = min(('start', 'end'), key=lambda key: abs(self.play_range[key] - ratio))
+        return self._on_range_motion(event)
+
+    def _on_range_motion(self, event):
+        if self._range_dragging is None:
+            return 'break'
+        geometry = self._progress_track_geometry(self.range_canvas)
+        if geometry is None:
+            return 'break'
+        left, travel = geometry
+        ratio = clamp_ratio((event.x - left) / travel)
+        gap = max(.000001, min(.01, .001 / max(self.visual_total, .001)))
+        if self._range_dragging == 'start':
+            ratio = min(ratio, self.play_range['end'] - gap)
+        else:
+            ratio = max(ratio, self.play_range['start'] + gap)
+        self.play_range = normalize_play_range({**self.play_range, self._range_dragging: ratio})
+        self._sync_visual_region()
+        return 'break'
+
+    def _on_range_release(self, event):
+        if self._range_dragging is not None:
+            self._on_range_motion(event)
+            self._range_dragging = None
+            self._set_play_range(self.play_range['start'], self.play_range['end'])
+            self.set_status('播放区间已调整；建议转调已按该片段更新，点击“用建议值”可应用。')
+        return 'break'
+
     # ---------- 每首歌的演奏配置与起播点 ----------
     def _capture_memory(self, start_ratio=None):
         label_id = self.start_label_id
@@ -765,7 +976,7 @@ class App:
         if start_ratio is None:
             # 手动记忆保存所选起点，不使用实时滚动的播放进度。
             start_ratio = clamp_ratio(label["ratio"]) if label else self.start_ratio
-        start_ratio = clamp_ratio(start_ratio)
+        start_ratio = self._clamp_to_play_range(start_ratio)
         if not label or abs(clamp_ratio(label["ratio"]) - start_ratio) > 0.000001:
             label_id = None
         return normalize_memory({
@@ -779,6 +990,8 @@ class App:
             "transpose": self.transpose_var.get(),
             "speed": self.speed_var.get(),
             "start": {"label_id": label_id, "ratio": start_ratio},
+            "play_range": dict(self.play_range),
+            "region_source": self._suggestion_source_range,
         })
 
     def _save_memory(self, source, memory):
@@ -833,6 +1046,8 @@ class App:
     def _apply_memory(self, memory):
         # 没有记忆的歌曲恢复默认参数，避免串用上一首歌的配置。
         settings = memory or {}
+        self.play_range = normalize_play_range(settings.get("play_range"))
+        self._suggestion_source_range = None
         available = set(self.channel_vars)
         keep = set(settings.get("channels", [])) & available
         if not keep:
@@ -849,11 +1064,22 @@ class App:
         self.speed_var.set(settings.get("speed", 1.0))
         self._on_speed_change()
         self._recompute(melody_track=settings.get("melody_track"),
-                        transpose=settings.get("transpose"))
+                        transpose=settings.get("transpose"), preserve_region=False)
+        self._suggestion_source_range = normalize_source_range(settings.get("region_source"))
+        if self._suggestion_source_range is not None:
+            self._apply_source_range(self._suggestion_source_range)
+        elif self._has_play_range() and self.visual_total > 0:
+            self._suggestion_source_range = self._source_range_for(self.play_range['start'], self.play_range['end'])
+        self._update_suggestions()
         self.start_ratio, self.start_label_id = (
             resolve_memory_start(memory, self._current_labels()) if memory else (0.0, None))
+        clamped_start = self._clamp_to_play_range(self.start_ratio)
+        if clamped_start != self.start_ratio:
+            self.start_label_id = None
+        self.start_ratio = clamped_start
         self.seek_var.set(self.start_ratio)
         self._set_visual_position(self.start_ratio)
+        self._sync_visual_region()
         total = self._display_total()
         self.time_label.config(text=f"{time_text(self.start_ratio * total)}/{time_text(total)}")
         self._draw_labels()
@@ -874,7 +1100,8 @@ class App:
             point = f"标签「{name}」({clamp_ratio(label['ratio']):.1%})"
         else:
             point = "曲首" if self.start_ratio == 0 else f"进度 {self.start_ratio:.1%}"
-        self.memory_status_var.set(f"{state}  |  所选起播点：{point}")
+        region = f"区间 {self.play_range['start']:.1%}—{self.play_range['end']:.1%}"
+        self.memory_status_var.set(f"{state}  |  所选起播点：{point}  |  {region}")
         self.remember_btn.config(state="normal" if self.tagged else "disabled")
         self.restore_memory_btn.config(state="normal" if memory else "disabled")
         memories = self._current_song_entry().get("playback_memory", {})
@@ -894,8 +1121,10 @@ class App:
         labels = self._current_labels(create=True)
         labels.append({
             "id": uuid.uuid4().hex,
-            "ratio": round(ratio, 6),
+            "ratio": ratio,
             "name": "",
+            "play_range": dict(self.play_range),
+            "region_source": self._suggestion_source_range,
         })
         labels.sort(key=lambda item: float(item.get("ratio", 0.0)))
         self._save_label_store()
@@ -915,8 +1144,11 @@ class App:
         canvas = self.marker_canvas
         canvas.delete("all")
         width = max(canvas.winfo_width(), 2)
-        left_pad = 9
-        usable = max(width - left_pad * 2, 1)
+        geometry = self._progress_track_geometry(canvas)
+        if geometry is None:
+            return
+        left_pad, usable = geometry
+        self._draw_range()
         for item in self._current_labels():
             label_id = item.get("id")
             if not label_id:
@@ -957,6 +1189,16 @@ class App:
         if not item:
             return
         ratio = max(0.0, min(float(item.get("ratio", 0.0)), 1.0))
+        region = normalize_play_range(item.get("play_range"))
+        source_range = normalize_source_range(item.get('region_source'))
+        if source_range is not None and source_range != self._suggestion_source_range and self.session_active:
+            self._on_stop()
+        self._cancel_region_selection()
+        self._set_play_range(region["start"], region["end"], move_to_start=False)
+        if source_range is not None:
+            self._suggestion_source_range = source_range
+            self._apply_source_range(source_range)
+            self._update_suggestions()
         self._move_playhead(ratio, label_id=label_id)
         total = self.visual_total
         name = str(item.get("name", "")).strip() or "无名称标签"
@@ -988,7 +1230,7 @@ class App:
             for memory in memories.values():
                 start = memory.get("start") if isinstance(memory, dict) else None
                 if isinstance(start, dict) and start.get("label_id") == label_id:
-                    start.update(label_id=None, ratio=round(ratio, 6))
+                    start.update(label_id=None, ratio=ratio)
         if self.start_label_id == label_id:
             self.start_label_id = None
             self.start_ratio = ratio
@@ -1005,7 +1247,9 @@ class App:
         item = self._find_label(label_id)
         if not item:
             return
-        item["ratio"] = round(self._current_progress_ratio(), 6)
+        item["ratio"] = self._current_progress_ratio()
+        item["play_range"] = dict(self.play_range)
+        item["region_source"] = self._suggestion_source_range
         if self.start_label_id == label_id:
             self.start_ratio = item["ratio"]
         self._current_labels().sort(key=lambda label: float(label.get("ratio", 0.0)))
@@ -1121,20 +1365,21 @@ class App:
     def _on_speed_change(self):
         self.speed_label.config(text=f"{self.speed_var.get():.2f} 倍")
         if self.tagged and not self.session_active:
-            total = self._display_total()
-            ratio = self.seek_var.get()
-            self.time_label.config(text=f"{time_text(ratio * total)}/{time_text(total)}")
-            self._preview_visual()
+            self._refresh_total()
 
     def _refresh_total(self):
         """参数变化时只刷新总时长与时间标签，不重算 tagged、不重置转调。"""
         if not self.tagged or self.session_active:
             return
+        at_region_start = abs(self.seek_var.get() - self.play_range['start']) < 1e-12
         self.cached_notes = self._compute_notes(silent=True)
         total = self._display_total()
         ratio = self.seek_var.get()
         self.time_label.config(text=f"{time_text(ratio * total)}/{time_text(total)}")
         self._preview_visual()
+        if self._suggestion_source_range is not None:
+            self._apply_source_range(self._suggestion_source_range)
+            self._move_playhead(self.play_range['start'] if at_region_start else self.seek_var.get())
 
     # ---------- 当前演奏可视化（仅 Tk 主线程绘图） ----------
     def _set_visual_schedule(self, notes, snapshot=None, title=None, detail=None, *, unavailable=()):
@@ -1149,6 +1394,7 @@ class App:
             if view is not None:
                 view.set_schedule(self.visual_notes, self.visual_title, self.visual_detail,
                                   unavailable=self.visual_unavailable)
+        self._sync_visual_region()
 
     def _preview_visual(self):
         if self.session_active:
@@ -1210,6 +1456,7 @@ class App:
         self.floating_visual.pack(fill='both', expand=True, padx=8, pady=(0, 6))
         self.floating_visual.set_schedule(self.visual_notes, self.visual_title, self.visual_detail,
                                           unavailable=self.visual_unavailable)
+        self._sync_visual_region()
         window.protocol('WM_DELETE_WINDOW', self._close_visual_window)
 
     def _close_visual_window(self):
@@ -1365,6 +1612,8 @@ class App:
         self.current_song_key = None
         self.current_index = -1
         self.cached_notes = []
+        self.play_range = {"start": 0.0, "end": 1.0}
+        self._suggestion_source_range = None
         self._set_visual_schedule([], title="", detail="")
         self.start_label_id = None
         self.start_ratio = 0.0
@@ -1398,9 +1647,14 @@ class App:
             self.set_status(f"解析完成，已恢复{'手动' if source == 'manual' else '自动'}记忆及起播点。")
         return True
 
-    def _recompute(self, melody_track=None, transpose=None):
+    def _recompute(self, melody_track=None, transpose=None, preserve_region=True):
         if not self.info:
             return
+        at_region_start = abs(self.seek_var.get() - self.play_range['start']) < 1e-12
+        source_range = self._suggestion_source_range if preserve_region else None
+        if source_range is None and preserve_region and self._has_play_range() and self.visual_total > 0:
+            source_range = self._source_range_for(self.play_range['start'], self.play_range['end'])
+        self._cancel_region_selection()
         keep = {ch for ch, v in self.channel_vars.items() if v.get()}
         if not keep:
             self.set_status("请至少勾选一个通道。")
@@ -1433,6 +1687,9 @@ class App:
         forced_idx = self.track_idx_map.get(self.melody_combo.get())
         tagged, self.melody_description = detect_melody(filtered_nb, forced_idx)
         self.tagged = tagged
+        self._suggestion_source_range = source_range
+        if transpose is not None:
+            self.transpose_var.set(str(transpose))
         self._update_suggestions()
         self.transpose_var.set(str(self.suggested_offset if transpose is None else transpose))
         self.cached_notes = self._compute_notes(silent=True)
@@ -1440,6 +1697,9 @@ class App:
         ratio = self.seek_var.get()
         self.time_label.config(text=f"{time_text(ratio * total)}/{time_text(total)}")
         self._preview_visual()
+        if source_range is not None and not self.session_active:
+            self._apply_source_range(source_range)
+            self._move_playhead(self.play_range['start'] if at_region_start else self.seek_var.get())
         self.set_status(f"解析完成，建议转调 {self.suggested_offset:+d}。调整参数后点播放。")
         self._refresh_memory_status()
 
@@ -1452,8 +1712,18 @@ class App:
             tagged = remove_glissando(tagged, gliss_set)
         return tagged
 
-    def _update_suggestions(self):
-        tagged = self._effective_tagged()
+    def _update_suggestions(self, region_notes=None):
+        tagged = self._effective_tagged() if region_notes is None else list(region_notes)
+        if region_notes is None and (self._has_play_range() or self._suggestion_source_range is not None):
+            if self._suggestion_source_range is not None:
+                start, end = self._suggestion_source_range
+                tagged = [note for note in tagged if start - TIME_EPSILON <= note.start < end - TIME_EPSILON]
+            else:
+                notes = self._compute_notes(silent=True)
+                speed = round(self.speed_var.get(), 2)
+                total = performance_duration(notes, speed)
+                tagged = select_tagged_region(tagged, notes, self.play_range['start'] * total,
+                                              self.play_range['end'] * total, speed=speed)
         self.suggested_offsets = {fold: find_best_transpose(tagged, fold) for fold in (False, True)}
         self.suggested_offset = self.suggested_offsets[self.fold_var.get()]
         gliss_set, gliss_runs = detect_glissando(self.tagged or [])
@@ -1461,7 +1731,8 @@ class App:
                                    self.melody_description, gliss_runs, len(gliss_set),
                                    self.fold_var.get(), self.suggested_offsets)
         self.report_text.delete("1.0", "end")
-        self.report_text.insert("end", report + "\n")
+        scope = "当前播放区间" if self._has_play_range() or self._suggestion_source_range is not None else "整曲"
+        self.report_text.insert("end", f"转调识别范围：{scope}（{len(tagged)} 个音符）\n" + report + "\n")
 
     def _on_mapping_change(self):
         if not self.tagged:
@@ -1477,6 +1748,9 @@ class App:
         self._refresh_total()
 
     def _use_suggested(self):
+        if self._has_play_range() and self.visual_total > 0 and self._suggestion_source_range is None:
+            self._suggestion_source_range = self._source_range_for(self.play_range["start"], self.play_range["end"])
+        self._update_suggestions()
         self.transpose_var.set(str(self.suggested_offset))
         self._refresh_total()
 
@@ -1502,20 +1776,31 @@ class App:
 
     # ---------- 进度条拖动 ----------
     def _on_scale_press(self, event):
+        if self._region_selecting:
+            self._region_consumed_click = True
+            self._accept_region_point(self.seek_scale.get(event.x, event.y))
+            return 'break'
         self.user_dragging = True
         if self.player:
             self.player.suppress_progress = True
 
     def _on_scale_move(self, val):
-        if self.updating_scale:
+        if self.updating_scale or self._region_selecting:
             return
-        ratio = float(val)
+        ratio = self._clamp_to_play_range(float(val))
+        if ratio != float(val):
+            self.updating_scale = True
+            self.seek_var.set(ratio)
+            self.updating_scale = False
         total = self.visual_total if self.session_active else self._display_total()
         self.time_label.config(text=f"{time_text(ratio * total)}/{time_text(total)}")
         self._set_visual_position(ratio)
 
     def _on_scale_release(self, event):
-        ratio = self.seek_var.get()
+        if self._region_consumed_click:
+            self._region_consumed_click = False
+            return 'break'
+        ratio = self._clamp_to_play_range(self.seek_var.get())
         self._move_playhead(ratio)
         if self.player and self.session_active:
             self.player.suppress_progress = False
@@ -1525,7 +1810,7 @@ class App:
         self._refresh_memory_status()
 
     def _move_playhead(self, ratio, *, label_id=None):
-        ratio = clamp_ratio(ratio)
+        ratio = self._clamp_to_play_range(ratio)
         self.start_ratio, self.start_label_id = ratio, label_id
         self.updating_scale = True
         self.seek_var.set(ratio)
@@ -1544,6 +1829,10 @@ class App:
         if not self.visual_notes or self.visual_total <= 0:
             return
         ratio = clamp_ratio(seconds / self.visual_total)
+        if self._region_selecting:
+            self._accept_region_point(ratio)
+            return
+        ratio = self._clamp_to_play_range(ratio)
         if self.session_active:
             if self.player:
                 # 定位前先暂停，防止跳转后立即发音；由用户手动继续。
@@ -1558,6 +1847,9 @@ class App:
 
     # ---------- 播放控制 ----------
     def _on_play_pause(self):
+        if self._region_selecting:
+            self.set_status("请先选定片段的两个端点，或按 Esc 取消。")
+            return
         if self.live_input:
             if self.live_input.paused.is_set():
                 self.live_input.paused.clear()
@@ -1587,6 +1879,10 @@ class App:
         self._stop_live(True)
         if self.session_active or self.player:
             self._on_stop()
+        at_region_start = abs(start_ratio - self.play_range['start']) < 1e-12
+        self._refresh_total()
+        if at_region_start:
+            start_ratio = self.play_range['start']
         cn = self._compute_notes(silent=False)
         if not cn:
             self.cached_notes = []
@@ -1594,9 +1890,19 @@ class App:
             self.set_status("没有可演奏的音符。")
             return
         speed = round(self.speed_var.get(), 2)
+        # 区间与参数同时冻结；结束点不改变全曲进度的分母。
+        region = dict(self.play_range)
+        start_ratio = self._clamp_to_play_range(start_ratio)
+        compiled = build_schedule(cn, speed)
+        total = max((note.end for note in compiled), default=0.0)
+        if start_ratio * total >= region['end'] * total - TIME_EPSILON:
+            start_ratio = region['start']
+        if not any(start_ratio * total - TIME_EPSILON <= note.start < region['end'] * total - TIME_EPSILON for note in compiled):
+            self.set_status('当前起点至区间终点没有可演奏的新音，请调整区间或转调。')
+            return
+        self._active_play_range = region
         # 快照必须来自生成 cn 时的配置；倒计时中修改界面不会串入自动记忆。
         memory = self._capture_memory(start_ratio)
-        start_ratio = clamp_ratio(start_ratio)
         self.start_ratio = start_ratio
         self.start_label_id = memory["start"]["label_id"] if memory else None
         pending_start = {'ratio': start_ratio, 'label_id': self.start_label_id}
@@ -1609,7 +1915,6 @@ class App:
         self.countdown_abort.clear()
         self.play_gen += 1
         gen = self.play_gen
-        compiled = build_schedule(cn, speed)
         unavailable = self._compute_unavailable(cn, speed)
         visual_position = start_ratio * max((note.end for note in compiled), default=0.0)
         visual_detail = f"{DURATION_MODES[self.duration_mode_var.get()]} · {speed:.2f}x"
@@ -1638,7 +1943,9 @@ class App:
             player = Player(cn, speed, launch_ratio,
                             lambda ratio, now, total: self.set_progress(ratio, now, total, gen,
                                                                        getattr(player, 'seek_serial', 0)), self.log,
-                            lambda fin: self.msg_queue.put(("finish", (fin, gen))))
+                            lambda fin: self.msg_queue.put(("finish", (fin, gen))),
+                            **({"region_start_ratio": region["start"], "end_ratio": region["end"]}
+                               if region != {"start": 0.0, "end": 1.0} else {}))
             self.player = player
             self._set_visual_schedule(getattr(player, 'notes', compiled),
                                       PlaybackSnapshot(launch_position, 'ready'), visual_title, visual_detail,
@@ -1655,6 +1962,7 @@ class App:
         tick(countdown)
 
     def _on_stop(self):
+        self._cancel_region_selection()
         self._stop_live(True)
         self.countdown_abort.set()
         self.play_gen += 1
@@ -1688,7 +1996,7 @@ class App:
         finished, gen = payload
         if gen != self.play_gen:
             return  # 旧的播放实例，忽略
-        position = self.visual_total if finished else self.visual_snapshot.position
+        position = self._active_play_range["end"] * self.visual_total if finished else self.visual_snapshot.position
         self.visual_snapshot = PlaybackSnapshot(position, 'finished' if finished else 'stopped')
         self.session_active = False
         self.player = None

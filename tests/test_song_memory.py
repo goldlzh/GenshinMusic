@@ -16,7 +16,8 @@ from unittest import mock
 import mido
 from midi_engine import MidiNote
 
-from song_memory import clamp_ratio, normalize_memory, preferred_memory, resolve_memory_start
+from song_memory import (clamp_ratio, normalize_memory, normalize_play_range,
+                         normalize_source_range, preferred_memory, resolve_memory_start)
 
 # 即使将来测试误触演奏函数，也不会向用户桌面发送按键。
 with mock.patch.dict(sys.modules, {"pydirectinput": mock.Mock()}):
@@ -63,9 +64,131 @@ class MemoryDataTests(unittest.TestCase):
         self.assertEqual(resolve_memory_start(memory, []), (0.3, None))
 
 
+    def test_play_range_defaults_keep_legacy_memory_and_label_start(self):
+        raw = {"channels": [0], "start": {"label_id": "verse", "ratio": 0.3}}
+        memory = normalize_memory(raw)
+        self.assertEqual(memory["play_range"], {"start": 0.0, "end": 1.0})
+        self.assertEqual(memory["start"], raw["start"])
+        self.assertEqual(resolve_memory_start(memory, [{"id": "verse", "ratio": 0.7}]),
+                         (0.7, "verse"))
+        memory["play_range"]["start"] = 0.2
+        self.assertEqual(normalize_memory(raw)["play_range"], {"start": 0.0, "end": 1.0})
+
+    def test_play_range_normalizes_order_bounds_without_losing_precision(self):
+        cases = (
+            ({"start": 0.8, "end": 0.2}, {"start": 0.2, "end": 0.8}),
+            ({"start": -3, "end": 0.8}, {"start": 0.0, "end": 0.8}),
+            ({"start": 3, "end": 0.2}, {"start": 0.2, "end": 1.0}),
+            ({"start": "0.1234567", "end": "0.9876543"},
+             {"start": 0.1234567, "end": 0.9876543}),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_play_range(raw), expected)
+
+    def test_invalid_or_empty_play_ranges_fall_back_to_full_song(self):
+        invalid = [None, [], "0.2-0.8", {}, {"start": 0.2}, {"end": 0.8},
+                   {"start": 0.5, "end": 0.5}, {"start": -2, "end": -1},
+                   {"start": 2, "end": 3}]
+        for endpoint in (None, "bad", [], {}, True, False, float("nan"),
+                         float("inf"), float("-inf")):
+            invalid.extend(({"start": endpoint, "end": 0.8},
+                            {"start": 0.2, "end": endpoint}))
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_play_range(raw), {"start": 0.0, "end": 1.0})
+                self.assertEqual(normalize_memory({"channels": [0], "play_range": raw})["channels"],
+                                 [0])
+
+    def test_play_range_accepts_every_positive_width_without_quantization(self):
+        for start, end in ((0.0, 0.000001), (0.5, 0.500001), (0.999999, 1.0),
+                           (0.5000001, 0.5000004), (0.5, 0.5000000000000001)):
+            with self.subTest(start=start):
+                expected = {"start": start, "end": end}
+                self.assertEqual(normalize_play_range(expected), expected)
+                self.assertEqual(normalize_play_range({"start": end, "end": start}), expected)
+                self.assertEqual(normalize_play_range(json.loads(json.dumps(expected))), expected)
+
+    def test_onset_boundaries_and_memory_start_preserve_one_sixth_through_json(self):
+        boundary = 1 / 6
+        # In a six-second song, rounding this ratio upward skips the one-second onset.
+        for start, end in ((boundary, 5 / 6), (0.0, boundary)):
+            with self.subTest(start=start, end=end):
+                raw = {"channels": [0], "start": {"ratio": start},
+                       "play_range": {"start": start, "end": end}}
+                saved = normalize_memory(raw)
+                restored = normalize_memory(json.loads(json.dumps(saved)))
+                self.assertEqual(restored["play_range"], raw["play_range"])
+                self.assertEqual(resolve_memory_start(restored, []), (start, None))
+                self.assertEqual(restored["start"]["ratio"] * 6, start * 6)
+                self.assertEqual(restored["play_range"]["end"] * 6, end * 6)
+                self.assertEqual(normalize_memory(restored), restored)
+
+    def test_source_range_accepts_raw_seconds_without_clamping_or_quantization(self):
+        for raw in ([1 / 6, 50 / 6], (0, 123.456789), ("0.1234567", "3.9876543")):
+            with self.subTest(raw=raw):
+                expected = tuple(float(endpoint) for endpoint in raw)
+                self.assertEqual(normalize_source_range(raw), expected)
+                memory = normalize_memory({"channels": [0], "region_source": raw})
+                self.assertEqual(memory["region_source"], expected)
+                restored = normalize_memory(json.loads(json.dumps(memory)))
+                self.assertEqual(restored["region_source"], expected)
+
+    def test_invalid_source_ranges_and_legacy_memory_have_no_source_region(self):
+        invalid = [None, [], [1], [0, 1, 2], "0,1", {"start": 0, "end": 1},
+                   [1, 1], [2, 1], [-1, 1]]
+        for endpoint in (None, "bad", [], {}, True, False, float("nan"),
+                         float("inf"), float("-inf")):
+            invalid.extend(([endpoint, 1], [0, endpoint]))
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalize_source_range(raw))
+                self.assertIsNone(normalize_memory({"channels": [0], "region_source": raw})["region_source"])
+        self.assertIsNone(normalize_memory({"channels": [0]})["region_source"])
+
+    def test_source_region_survives_full_playback_range_and_is_an_independent_snapshot(self):
+        raw_source = [12 + 1 / 6, 20 + 5 / 6]
+        memory = normalize_memory({"channels": [0], "region_source": raw_source,
+                                   "play_range": {"start": 0, "end": 1}})
+        raw_source[0] = 0
+        restored = normalize_memory(json.loads(json.dumps(memory)))
+        self.assertEqual(restored["region_source"], (12 + 1 / 6, 20 + 5 / 6))
+        self.assertEqual(restored["play_range"], {"start": 0, "end": 1})
+
+    def test_range_snapshots_are_independent_for_memories_and_labels(self):
+        raw_range = {"start": 0.2, "end": 0.8}
+        raw_memory = {"channels": [0], "play_range": raw_range}
+        memory = normalize_memory(raw_memory)
+        label_range = normalize_play_range(raw_range)
+        memory["play_range"]["start"] = 0.4
+        label_range["end"] = 0.9
+        self.assertEqual(raw_range, {"start": 0.2, "end": 0.8})
+        self.assertEqual(memory["play_range"], {"start": 0.4, "end": 0.8})
+        self.assertEqual(label_range, {"start": 0.2, "end": 0.9})
+        self.assertEqual(normalize_memory(json.loads(json.dumps(raw_memory)))["play_range"],
+                         raw_range)
+
+    def test_preferred_memory_restores_each_sources_own_play_range(self):
+        manual = {"channels": [1], "play_range": {"start": 0.1, "end": 0.4}}
+        automatic = {"channels": [0], "play_range": {"start": 0.6, "end": 0.9}}
+        entry = {"playback_memory": {"manual": manual, "auto": automatic}}
+        source, memory = preferred_memory(entry)
+        self.assertEqual(source, "manual")
+        self.assertEqual(memory["play_range"], manual["play_range"])
+        memory["play_range"]["end"] = 1.0
+        self.assertEqual(manual["play_range"]["end"], 0.4)
+        entry["playback_memory"].pop("manual")
+        source, memory = preferred_memory(entry)
+        self.assertEqual(source, "auto")
+        self.assertEqual(memory["play_range"], automatic["play_range"])
+
+
 class FakePlayer:
-    def __init__(self, chords, speed, start_ratio, progress_cb, log_cb, finish_cb):
+    def __init__(self, chords, speed, start_ratio, progress_cb, log_cb, finish_cb,
+                 *, region_start_ratio=0.0, end_ratio=1.0):
         self.total = gui.performance_duration(chords, speed)
+        self.region_start = self.total * region_start_ratio
+        self.region_end = self.total * end_ratio
         self.play_time = self.total * start_ratio
         self.start_ratio = start_ratio
         self.speed = speed
@@ -83,7 +206,7 @@ class FakePlayer:
         self.stopped = True
 
     def seek(self, seconds):
-        self.play_time = seconds
+        self.play_time = max(self.region_start, min(seconds, self.region_end))
 
 
 class AppMemoryTests(unittest.TestCase):

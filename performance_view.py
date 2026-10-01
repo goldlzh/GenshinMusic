@@ -20,6 +20,7 @@ COLORS = {
     'active': '#5ce5af', 'recent': '#f7c873', 'text': '#dce6f4',
     'muted': '#8da0b8', 'key': '#233449', 'cursor': '#f7c873',
     'unavailable': '#ff737d', 'unavailable_past': '#a8525e', 'outside_grid': '#563440',
+    'play_range': '#20394b', 'range_boundary': '#87cce9', 'selection_anchor': '#d5a1f5',
 }
 PHASE_NAMES = {'preview': '谱面预览', 'ready': '等待起播', 'countdown': '倒计时',
                'playing': '演奏中', 'paused': '已暂停', 'stopped': '已停止', 'finished': '演奏完成'}
@@ -102,6 +103,8 @@ class PerformanceView(ttk.Frame):
         self._hover_text = ''
         self._status_text = ''
         self._manual_left = None
+        self.play_range = None
+        self.selection_anchor = None
         self.follow_var = tk.BooleanVar(self, value=True)
 
         toolbar = ttk.Frame(self)
@@ -166,9 +169,42 @@ class PerformanceView(ttk.Frame):
         self._hover_text = ''
         self._manual_left = None
         self._drawn_timeline = None
+        self.play_range = None
+        self.selection_anchor = None
+        self.canvas.delete('play-range', 'selection-anchor')
         self.follow_var.set(True)
         self._revision += 1
         self._invalidate()
+
+    def _range_position(self, seconds):
+        if seconds is None or not self.index.notes:
+            return None
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, min(seconds, self.index.total))
+
+    def set_play_range(self, start_seconds=None, end_seconds=None):
+        """只显示演奏秒数对应的选区；传入 None 清除，不改变播放位置或时间轴。"""
+        start, end = self._range_position(start_seconds), self._range_position(end_seconds)
+        selected = tuple(sorted((start, end))) if start is not None and end is not None else None
+        if selected is not None and selected[1] - selected[0] <= TIME_EPSILON:
+            selected = None
+        if selected != self.play_range:
+            self.play_range = selected
+            self._invalidate()
+            self.update_state(self.snapshot, force=True)
+
+    def set_selection_anchor(self, seconds):
+        """显示两点选段的首点；None 清除提示，不改变原有点击定位回调。"""
+        anchor = self._range_position(seconds)
+        if anchor != self.selection_anchor:
+            self.selection_anchor = anchor
+            self._invalidate()
+            self.update_state(self.snapshot, force=True)
 
     def _time_bounds(self, span):
         start = min(0.0, self.unavailable_index.start)
@@ -246,7 +282,7 @@ class PerformanceView(ttk.Frame):
         signature = (self._revision, round(snapshot.position, 3), snapshot.phase,
                      snapshot.active_note_ids, recent, width, height,
                      self.keyboard_canvas.winfo_width(), self.view_mode.get(), self.window_span.get())
-        signature += (self.follow_var.get(), self._manual_left)
+        signature += (self.follow_var.get(), self._manual_left, self.play_range, self.selection_anchor)
         if signature == self._last_signature:
             return
         self._last_signature = signature
@@ -335,6 +371,7 @@ class PerformanceView(ttk.Frame):
                 if label_visible:
                     self.canvas.coords(label, (x1 + x2) / 2, y)
         self._draw_unavailable(left_time, span, margin, right, x_at, y_at, staff, row_height, snapshot)
+        self._draw_play_range(margin, right, top, bottom, x_at)
         self.canvas.delete('cursor')
         cursor_x = x_at(snapshot.position)
         if margin <= cursor_x <= right:
@@ -351,9 +388,56 @@ class PerformanceView(ttk.Frame):
         state_text = f'按下 {len(held)} 键：{key_text}' if held else '当前未按键'
         title = self.song_name if len(self.song_name) <= 24 else self.song_name[:23] + '…'
         missing = f' · 无法演奏 {len(self.unavailable_index.notes)} 音' if self.unavailable_index.notes else ''
+        selection = (f' · 选区 {time_text(self.play_range[0])} ～ {time_text(self.play_range[1])}'
+                     if self.play_range is not None else '')
+        if self.selection_anchor is not None:
+            selection += f' · 首点 {time_text(self.selection_anchor)}，再点击一个位置完成选段'
         self._status_text = (f'{PHASE_NAMES.get(snapshot.phase, "预览")}  {time_text(snapshot.position)} / '
-                             f'{time_text(self.index.total)}  ·  {state_text}{missing}  ·  {title} {self.detail}')
+                             f'{time_text(self.index.total)}  ·  {state_text}{missing}{selection}  ·  {title} {self.detail}')
         self.status_var.set(self._hover_text or self._status_text)
+
+    def _draw_play_range(self, margin, right, top, bottom, x_at):
+        canvas = self.canvas
+        canvas.delete('play-range', 'selection-anchor')
+        if self.play_range is not None:
+            start, end = self.play_range
+            left_x, right_x = max(margin, x_at(start)), min(right, x_at(end))
+            if right_x > left_x:
+                canvas.create_rectangle(left_x, top - 4, right_x, bottom,
+                                        fill=COLORS['play_range'], outline='', state='disabled',
+                                        tags=('play-range', 'play-range-fill'))
+                # 留在底色之上、网格和音符之下，不能遮挡已有长音或不可奏音。
+                canvas.tag_raise('play-range-fill', 'grid-background')
+            first_caption_bottom = None
+            for seconds, text, tag in ((start, '起点', 'play-range-start'), (end, '终点', 'play-range-end')):
+                x = x_at(seconds)
+                if margin <= x <= right:
+                    canvas.create_line(x, top - 4, x, bottom, fill=COLORS['range_boundary'], width=2,
+                                       state='disabled', tags=('play-range', tag))
+                    anchor, dx = ('nw', 4) if text == '起点' else ('ne', -4)
+                    if x < margin + 40:
+                        anchor, dx = 'nw', 4
+                    elif x > right - 40:
+                        anchor, dx = 'ne', -4
+                    caption_y = (first_caption_bottom + 2 if first_caption_bottom is not None
+                                 and x_at(end) - x_at(start) < 70 else top)
+                    caption = canvas.create_text(x + dx, caption_y, text=text, anchor=anchor,
+                                                 fill=COLORS['range_boundary'], font=('Microsoft YaHei UI', 8),
+                                                 state='disabled', tags=('play-range', 'play-range-caption'))
+                    bounds = canvas.bbox(caption)
+                    if bounds:
+                        canvas.move(caption, max(0, margin - bounds[0]) - max(0, bounds[2] - right), 0)
+                        if text == '起点':
+                            first_caption_bottom = bounds[3]
+        if self.selection_anchor is not None:
+            x = x_at(self.selection_anchor)
+            if margin <= x <= right:
+                canvas.create_line(x, top - 4, x, bottom, fill=COLORS['selection_anchor'], width=2,
+                                   dash=(4, 3), state='disabled', tags=('selection-anchor', 'selection-anchor-line'))
+                anchor, dx = ('ne', -4) if x > (margin + right) / 2 else ('nw', 4)
+                canvas.create_text(x + dx, top, text='首点', anchor=anchor,
+                                   fill=COLORS['selection_anchor'], font=('Microsoft YaHei UI', 8),
+                                   state='disabled', tags=('selection-anchor', 'selection-anchor-caption'))
 
     def _draw_unavailable(self, left, span, margin, right, x_at, y_at, staff, row_height, snapshot):
         visible = self.unavailable_index.visible(left, left + span)
@@ -392,7 +476,8 @@ class PerformanceView(ttk.Frame):
     def _draw_grid(self, width, height, margin, right, left_time, span, x_at, y_at, staff, row_height):
         canvas = self.canvas
         canvas.delete('grid')
-        canvas.create_rectangle(margin, y_at(20.5), right, y_at(-.5), fill='#162638', outline='', tags='grid')
+        canvas.create_rectangle(margin, y_at(20.5), right, y_at(-.5), fill='#162638', outline='',
+                                tags=('grid', 'grid-background'))
         if staff:
             for degree in (-3, -1, 1, 3, 5, 9, 11, 13, 15, 17):
                 canvas.create_line(margin, y_at(degree), right, y_at(degree),

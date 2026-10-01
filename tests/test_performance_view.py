@@ -222,6 +222,135 @@ class CanvasTests(unittest.TestCase):
         self.assertFalse(self.view._unavailable_items)
         self.assertFalse(old_ids.intersection(self.view.canvas.find_all()))
 
+    def test_play_range_tracks_seconds_in_both_views_without_changing_playback_or_notes(self):
+        callback = mock.Mock(); self.view.on_seek = callback
+        for mode in ('五线谱时值', '长条谱'):
+            with self.subTest(mode=mode):
+                self.view.view_mode.set(mode)
+                snapshot = PlaybackSnapshot(1.5, 'playing', (0,))
+                self.draw(snapshot)
+                index = self.view.index
+                self.view.set_play_range(2, 4)
+                margin, _, left, pixels = self.view._drawn_timeline
+                expected = [margin + (seconds - left) * pixels for seconds in (2, 4)]
+                fill, = self.view.canvas.find_withtag('play-range-fill')
+                coords = self.view.canvas.coords(fill)
+                self.assertAlmostEqual(coords[0], expected[0])
+                self.assertAlmostEqual(coords[2], expected[1])
+                for tag, x in zip(('play-range-start', 'play-range-end'), expected):
+                    line, = self.view.canvas.find_withtag(tag)
+                    self.assertAlmostEqual(self.view.canvas.coords(line)[0], x)
+                stacking = list(self.view.canvas.find_all())
+                background, = self.view.canvas.find_withtag('grid-background')
+                self.assertLess(stacking.index(background), stacking.index(fill))
+                for item in self.view.canvas.find_withtag('grid'):
+                    if item != background:
+                        self.assertGreater(stacking.index(item), stacking.index(fill))
+                self.assertGreater(stacking.index(self.view._items[0][0]), stacking.index(fill))
+                self.assertEqual(self.view.canvas.itemcget(self.view._items[0][0], 'fill'), COLORS['active'])
+                self.assertEqual(self.view.keyboard_canvas.itemcget(self.view._key_items['A'][0], 'fill'), COLORS['active'])
+                self.assertIs(self.view.snapshot, snapshot)
+                self.assertIs(self.view.index, index)
+                self.assertEqual(self.view.index.notes, self.notes)
+                self.assertIn('选区 0:02.000 ～ 0:04.000', self.view.status_var.get())
+        callback.assert_not_called()
+
+    def test_play_range_clips_to_browsed_window_without_moving_it_or_inventing_endpoints(self):
+        self.view.set_schedule([ScheduledNote(0, 30, 'A', True)])
+        self.view.window_span.set('4 秒')
+        self.view.follow_var.set(False)
+        self.view._manual_left = 5
+        snapshot = PlaybackSnapshot(7, 'paused')
+        self.draw(snapshot)
+        self.view.set_play_range(2, 12)
+        margin, right, left, _ = self.view._drawn_timeline
+        self.assertEqual(left, 5)
+        fill, = self.view.canvas.find_withtag('play-range-fill')
+        coords = self.view.canvas.coords(fill)
+        self.assertEqual((coords[0], coords[2]), (margin, right))
+        self.assertFalse(self.view.canvas.find_withtag('play-range-start'))
+        self.assertFalse(self.view.canvas.find_withtag('play-range-end'))
+        self.assertFalse(self.view.follow_var.get())
+        self.view._manual_left = 20
+        self.draw(snapshot)
+        self.assertFalse(self.view.canvas.find_withtag('play-range'))
+        self.assertEqual(self.view.play_range, (2, 12))
+
+    def test_selection_anchor_is_visual_only_and_existing_seek_callback_keeps_full_song_coordinates(self):
+        callback = mock.Mock(); self.view.on_seek = callback
+        snapshot = PlaybackSnapshot(2.5, 'paused')
+        self.draw(snapshot)
+        self.view.set_play_range(2, 3)
+        self.view.set_selection_anchor(1.25)
+        margin, _, left, pixels = self.view._drawn_timeline
+        line, = self.view.canvas.find_withtag('selection-anchor-line')
+        self.assertAlmostEqual(self.view.canvas.coords(line)[0], margin + (1.25 - left) * pixels)
+        self.assertIn('首点 0:01.250', self.view.status_var.get())
+        self.assertIn('再点击一个位置完成选段', self.view.status_var.get())
+        self.assertIs(self.view.snapshot, snapshot)
+        for item in self.view.canvas.find_withtag('play-range') + self.view.canvas.find_withtag('selection-anchor'):
+            self.assertEqual(self.view.canvas.itemcget(item, 'state'), 'disabled')
+        callback.assert_not_called()
+        self.view._on_score_click(SimpleNamespace(x=margin + (1 - left) * pixels))
+        callback.assert_called_once_with(1)
+        self.view.set_selection_anchor(None)
+        self.assertFalse(self.view.canvas.find_withtag('selection-anchor'))
+        self.assertNotIn('首点', self.view.status_var.get())
+
+    def test_narrow_range_captions_remain_inside_the_plot_without_overlapping(self):
+        self.view.set_schedule([ScheduledNote(0, 30, 'A', True)])
+        self.view.window_span.set('4 秒')
+        self.view.follow_var.set(False)
+        self.view._manual_left = 5
+        self.draw(PlaybackSnapshot(7, 'paused'))
+        for start, end in ((5, 5.1), (8.9, 9)):
+            with self.subTest(start=start, end=end):
+                self.view.set_play_range(start, end)
+                margin, right, _, _ = self.view._drawn_timeline
+                captions = self.view.canvas.find_withtag('play-range-caption')
+                self.assertEqual(len(captions), 2)
+                bounds = [self.view.canvas.bbox(item) for item in captions]
+                self.assertTrue(all(margin <= box[0] < box[2] <= right for box in bounds))
+                self.assertLessEqual(bounds[0][3], bounds[1][1])
+
+    def test_range_inputs_are_sorted_clamped_and_can_be_cleared_without_stale_drawings(self):
+        self.draw(PlaybackSnapshot(1, 'preview'))
+        self.view.set_play_range(9, -2)
+        self.assertEqual(self.view.play_range, (0, 5))
+        self.view.set_selection_anchor(9)
+        self.assertEqual(self.view.selection_anchor, 5)
+        for invalid in (float('nan'), float('inf'), 'invalid', None):
+            with self.subTest(invalid=invalid):
+                self.view.set_play_range(1, 2)
+                self.view.set_play_range(invalid, 2)
+                self.assertIsNone(self.view.play_range)
+                self.assertFalse(self.view.canvas.find_withtag('play-range'))
+                self.view.set_selection_anchor(1)
+                self.view.set_selection_anchor(invalid)
+                self.assertIsNone(self.view.selection_anchor)
+                self.assertFalse(self.view.canvas.find_withtag('selection-anchor'))
+        self.view.set_play_range(3, 3)
+        self.assertIsNone(self.view.play_range)
+        self.view.set_play_range(1, 2)
+        self.view.set_play_range()
+        self.assertFalse(self.view.canvas.find_withtag('play-range'))
+
+    def test_new_schedule_immediately_removes_range_and_first_point_without_extending_empty_scores(self):
+        self.draw(PlaybackSnapshot(1, 'preview'))
+        self.view.set_play_range(1, 4)
+        self.view.set_selection_anchor(2)
+        self.view.set_schedule([], unavailable=[UnavailableNote(0, 10, 84, '超出音域')])
+        self.assertIsNone(self.view.play_range)
+        self.assertIsNone(self.view.selection_anchor)
+        self.assertFalse(self.view.canvas.find_withtag('play-range'))
+        self.assertFalse(self.view.canvas.find_withtag('selection-anchor'))
+        self.view.set_play_range(1, 4)
+        self.view.set_selection_anchor(2)
+        self.draw(PlaybackSnapshot())
+        self.assertIsNone(self.view.play_range)
+        self.assertIsNone(self.view.selection_anchor)
+        self.assertEqual(self.view.index.total, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

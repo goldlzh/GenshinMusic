@@ -11,6 +11,42 @@ def clamp_ratio(value):
     return max(0.0, min(value, 1.0)) if math.isfinite(value) else 0.0
 
 
+def normalize_play_range(value):
+    """Normalize a playback-range snapshot; old or invalid ranges mean the full song."""
+    full_song = {"start": 0.0, "end": 1.0}
+    if not isinstance(value, dict):
+        return full_song
+    try:
+        endpoints = [value["start"], value["end"]]
+        if any(isinstance(endpoint, bool) for endpoint in endpoints):
+            return full_song
+        endpoints = [float(endpoint) for endpoint in endpoints]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return full_song
+    if not all(math.isfinite(endpoint) for endpoint in endpoints):
+        return full_song
+    # Keep exact float boundaries so saving an onset does not move it past the note.
+    start, end = sorted(clamp_ratio(endpoint) for endpoint in endpoints)
+    if end <= start:
+        return full_song
+    return {"start": start, "end": end}
+
+
+def normalize_source_range(value):
+    """Retain source-score seconds so a region survives a changed playback timeline."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    if any(isinstance(endpoint, bool) for endpoint in value):
+        return None
+    try:
+        start, end = (float(endpoint) for endpoint in value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end:
+        return None
+    return start, end
+
+
 def normalize_memory(value):
     """返回独立、可序列化的记忆快照；不合法的记录不参与恢复。"""
     if not isinstance(value, dict) or not isinstance(value.get("channels"), list):
@@ -57,7 +93,9 @@ def normalize_memory(value):
         "sustain_pedal": flag("sustain_pedal", False),
         "transpose": transpose,
         "speed": round(max(0.5, min(speed, 2.0)), 2),
-        "start": {"label_id": label_id, "ratio": round(clamp_ratio(start.get("ratio", 0)), 6)},
+        "start": {"label_id": label_id, "ratio": clamp_ratio(start.get("ratio", 0))},
+        "play_range": normalize_play_range(value.get("play_range")),
+        "region_source": normalize_source_range(value.get("region_source")),
     }
 
 
