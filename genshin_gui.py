@@ -9,6 +9,7 @@ import uuid
 import ctypes
 from ctypes import wintypes
 import tkinter as tk
+from scrollable_frame import ScrollableFrame
 from tkinter import ttk, messagebox, simpledialog
 from song_memory import clamp_ratio, normalize_memory, normalize_play_range, normalize_source_range, preferred_memory, resolve_memory_start
 from song_library import (SORT_MODES, normalize_sort_mode, song_key, song_entry,
@@ -366,10 +367,15 @@ class App:
         pad = {"padx": 6, "pady": 3}
         self.hotkey_vars = {}
         self.root.columnconfigure(0, weight=1)
-        # 通道较多或窗口变矮时，谱面让出空间，播放/停止按钮保持可见。
-        self.root.rowconfigure(1, weight=1)
+        # 表单可滚动，播放/停止留在窗口底部，避免挤掉选项卡内容。
+        self.root.rowconfigure(0, weight=1)
+        self.body_scroll = ScrollableFrame(self.root)
+        self.body_scroll.grid(row=0, column=0, sticky='nsew')
+        body = self.body_scroll.content
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
 
-        top = ttk.LabelFrame(self.root, text="曲目")
+        top = ttk.LabelFrame(body, text="曲目")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
         ttk.Label(top, text="搜索:").grid(row=0, column=0, **pad)
         self.search_var = tk.StringVar()
@@ -392,7 +398,7 @@ class App:
         ttk.Label(top, textvariable=self.song_time_var).grid(
             row=2, column=0, columnspan=5, sticky="w", **pad)
 
-        self.main_tabs = ttk.Notebook(self.root, height=280)
+        self.main_tabs = ttk.Notebook(body)
         self.main_tabs.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self.visual_view = PerformanceView(self.main_tabs, on_detach=self._open_visual_window,
                                            on_seek=self._on_visual_seek,
@@ -401,13 +407,18 @@ class App:
         rep = ttk.Frame(self.main_tabs)
         self.main_tabs.add(rep, text="解析报告 / 日志")
         self.report_text = tk.Text(rep, height=13, wrap="none", font=("Consolas", 9))
-        self.report_text.pack(fill="both", expand=True, side="left")
+        rep.rowconfigure(0, weight=1)
+        rep.columnconfigure(0, weight=1)
+        self.report_text.grid(row=0, column=0, sticky='nsew')
         sb = ttk.Scrollbar(rep, command=self.report_text.yview)
-        sb.pack(side="right", fill="y")
+        sb.grid(row=0, column=1, sticky='ns')
         self.report_text.config(yscrollcommand=sb.set)
+        hsb = ttk.Scrollbar(rep, orient='horizontal', command=self.report_text.xview)
+        hsb.grid(row=1, column=0, sticky='ew')
+        self.report_text.config(xscrollcommand=hsb.set)
         self._build_live_panel()
 
-        param = ttk.LabelFrame(self.root, text="演奏参数")
+        param = ttk.LabelFrame(body, text="演奏参数")
         param.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
 
         ttk.Label(param, text="乐器通道:").grid(row=0, column=0, sticky="nw", **pad)
@@ -464,7 +475,7 @@ class App:
                   foreground="#666666").grid(row=7, column=0, columnspan=4, sticky="w", **pad)
 
         # 播放模式
-        mode = ttk.LabelFrame(self.root, text="播放模式")
+        mode = ttk.LabelFrame(body, text="播放模式")
         mode.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
         self.mode_var = tk.StringVar(value="sequential")
         ttk.Radiobutton(mode, text="顺序播放", value="sequential", variable=self.mode_var).pack(side="left", padx=8)
@@ -472,7 +483,7 @@ class App:
         ttk.Radiobutton(mode, text="随机播放", value="random", variable=self.mode_var).pack(side="left", padx=8)
 
         # 标签工具栏；全局快捷键在游戏窗口前台时也能插入无名称标签
-        tagbar = ttk.Frame(self.root)
+        tagbar = ttk.Frame(body)
         tagbar.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 0))
         ttk.Button(tagbar, text="插入标签", command=self._insert_label).pack(side="left", padx=4)
         ttk.Label(tagbar, text="插入快捷键:").pack(side="left", padx=(12, 4))
@@ -488,7 +499,7 @@ class App:
         ttk.Label(tagbar, text="双击标签改名，右键可删除", foreground="#666666").pack(side="right", padx=4)
 
         # 进度条（可拖动跳转）及其可点击标签层
-        prog = ttk.Frame(self.root)
+        prog = ttk.Frame(body)
         prog.grid(row=5, column=0, sticky="ew", padx=8, pady=2)
         # 标签与滑块共享一列，时间文字只占右列，避免两条轨道宽度不一致。
         prog.columnconfigure(0, weight=1)
@@ -520,7 +531,7 @@ class App:
         self.range_status_var = tk.StringVar(value="播放区间：全曲；拖动下方起止指针可调整")
         ttk.Label(prog, textvariable=self.range_status_var).grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
 
-        memory_frame = ttk.LabelFrame(self.root, text="歌曲记忆")
+        memory_frame = ttk.LabelFrame(body, text="歌曲记忆")
         memory_frame.grid(row=6, column=0, sticky="ew", padx=8, pady=4)
         memory_actions = ttk.Frame(memory_frame)
         memory_actions.pack(fill="x", padx=4, pady=2)
@@ -541,7 +552,7 @@ class App:
 
         # 播放控制
         ctrl = ttk.Frame(self.root)
-        ctrl.grid(row=7, column=0, sticky="ew", padx=8, pady=6)
+        ctrl.grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         for col in range(4):
             ctrl.columnconfigure(col, weight=1, uniform="player_controls")
 
@@ -564,11 +575,25 @@ class App:
             self._bind_hotkey_entry(entry, action)
 
         self.status_var = tk.StringVar(value="就绪。请选择曲目并解析。")
-        ttk.Label(self.root, textvariable=self.status_var).grid(row=8, column=0, sticky="ew", padx=10, pady=2)
+        status = ttk.Label(self.root, textvariable=self.status_var, wraplength=780)
+        status.grid(row=2, column=0, sticky="ew", padx=10, pady=2)
+        status.bind('<Configure>', lambda e: status.configure(wraplength=max(100, e.width)))
+        self._song_sections = (param, mode, tagbar, prog, memory_frame)
+        self.main_tabs.bind('<<NotebookTabChanged>>', self._on_main_tab_changed)
+
+    def _on_main_tab_changed(self, event=None):
+        live = self.main_tabs.select() == str(self.live_tab)
+        for section in self._song_sections:
+            if live:
+                section.grid_remove()
+            else:
+                section.grid()
+        self.body_scroll.canvas.yview_moveto(0)
 
     # ---------- 歌曲标签 / 全局快捷键 ----------
     def _build_live_panel(self):
         tab = ttk.Frame(self.main_tabs, padding=12)
+        self.live_tab = tab
         self.main_tabs.add(tab, text="USB MIDI 实时演奏")
         saved = self.label_store['settings'].get('live_midi', {})
         saved = saved if isinstance(saved, dict) else {}
@@ -1444,14 +1469,16 @@ class App:
         window.title("实时演奏可视化 · 原神 MIDI")
         window.geometry(f"{min(1040, window.winfo_screenwidth() - 80)}x{min(580, window.winfo_screenheight() - 80)}")
         window.minsize(680, 360)
-        toolbar = ttk.Frame(window)
+        scroll = ScrollableFrame(window)
+        scroll.pack(fill='both', expand=True)
+        toolbar = ttk.Frame(scroll.content)
         toolbar.pack(fill='x', padx=8, pady=(5, 2))
         ttk.Checkbutton(toolbar, text="置顶显示", variable=self.visual_topmost_var,
                         command=lambda: window.attributes('-topmost', self.visual_topmost_var.get())).pack(side='left')
         ttk.Label(toolbar, text="显示软件发出的按键状态，便于观察长音与和弦。",
                   foreground='#666666').pack(side='left', padx=12)
         window.attributes('-topmost', self.visual_topmost_var.get())
-        self.floating_visual = PerformanceView(window, view_mode=self.visual_mode_var,
+        self.floating_visual = PerformanceView(scroll.content, view_mode=self.visual_mode_var,
                                                window_span=self.visual_span_var, on_seek=self._on_visual_seek)
         self.floating_visual.pack(fill='both', expand=True, padx=8, pady=(0, 6))
         self.floating_visual.set_schedule(self.visual_notes, self.visual_title, self.visual_detail,
